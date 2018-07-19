@@ -91,3 +91,8 @@ interface ARevisitor<AT, BT extends AT, CT extends AT, DT extends CT> {
 
 So far the generation is only working by inheritance.
 A comprehensive implementation should also support classes references.
+
+
+## TODO
+
+Group classes by their Revisitor Metadata

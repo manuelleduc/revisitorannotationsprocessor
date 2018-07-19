@@ -8,11 +8,16 @@ import org.apache.commons.lang.StringUtils;
 
 import javax.annotation.processing.*;
 import javax.lang.model.element.Element;
+import javax.lang.model.element.Modifier;
 import javax.lang.model.element.TypeElement;
+import javax.lang.model.type.TypeMirror;
 import java.io.IOException;
 import java.util.*;
 import java.util.stream.Collectors;
 
+import static com.squareup.javapoet.MethodSpec.methodBuilder;
+import static java.lang.System.lineSeparator;
+import static java.util.Arrays.asList;
 import static javax.lang.model.SourceVersion.RELEASE_8;
 import static javax.lang.model.element.Modifier.*;
 
@@ -21,41 +26,33 @@ import static javax.lang.model.element.Modifier.*;
 @AutoService(Processor.class)
 public class RevisitorProcessor extends AbstractProcessor {
 
+
     @Override
     public boolean process(final Set<? extends TypeElement> annotations, final RoundEnvironment roundEnv) {
-        for (final TypeElement te : annotations) {
-            final Set<? extends Element> classes = roundEnv.getElementsAnnotatedWith(te).stream().filter(c -> c.getAnnotationMirrors().stream().noneMatch(am -> {
-                // filter derived Truffle classes
-                return Objects.equals(am.getAnnotationType().asElement().getSimpleName().toString(), "GeneratedBy");
-            })).collect(Collectors.toSet());
 
-            // look for AST root element
-            final TypeElement e = findRoot(classes);
-            if (e != null) {
-                final String[] path = splitFullyQualifiedName(e);
-                writeToDisk(buildJavaFile(initRevisitorClassName(path), initRevisitorPackageName(path), initBaseClassName(path), initBasePackageName(path), classes));
-            }
+//        getClasses(roundEnv);
+        for (final TypeElement te : annotations) {
+
+            // filter GeneratedBy annotations.
+            final Element descriptor = roundEnv.getElementsAnnotatedWith(te).iterator().next();
+
+            final Revisitor annotation = descriptor.getAnnotation(Revisitor.class);
+
+            final List<String> packages = Arrays.asList(annotation.packages());
+
+
+            final Set<? extends Element> classes = roundEnv.getRootElements().stream().filter(e ->
+                    packages.contains(processingEnv.getElementUtils().getPackageOf(e).getQualifiedName().toString())).collect(Collectors.toSet());
+
+            final String[] path = splitFullyQualifiedName(descriptor);
+            JavaFile javaFile = buildJavaFile(initRevisitorClassName(path), initRevisitorPackageName(path), initBaseClassName(path), initBasePackageName(path), classes);
+            writeToDisk(javaFile);
+
+
         }
         return true;
     }
 
-    /**
-     * Find the root element of the AST by analyzing a set of classes
-     *
-     * @param classes A set of classes
-     * @return the root element
-     */
-    private TypeElement findRoot(Set<? extends Element> classes) {
-        for (final Element e0 : classes) {
-            final TypeElement e = ((TypeElement) e0);
-            boolean res = classes.stream().anyMatch(x -> Objects.equals(e.getSuperclass(), x.asType()));
-
-            if (!res) {
-                return e;
-            }
-        }
-        return null;
-    }
 
     /**
      * Generate a revisitor from a set of classes.
@@ -70,59 +67,80 @@ public class RevisitorProcessor extends AbstractProcessor {
     private JavaFile buildJavaFile(String revClassName, String revPackages, String className, String packages, Set<? extends Element> classes) {
 
         // build the interface
-        final TypeSpec.Builder builder = TypeSpec.interfaceBuilder(ClassName.get(revPackages, revClassName)).addTypeVariables(classes.stream().map(
-                c -> {
+        final TypeSpec.Builder builder = TypeSpec.interfaceBuilder(ClassName.get(revPackages, revClassName))
+                .addModifiers(PUBLIC)
+                .addTypeVariables(classes.stream().sorted((Comparator<Element>) (o1, o2) -> o1.getSimpleName().toString().compareTo(o2.getSimpleName().toString())).map(
+                        c -> {
+                            // build the bounded generics
+                            final TypeVariableName baseTypeVariableName = TypeVariableName.get(c.getSimpleName() + "T");
+                            return classes.stream().filter(x -> Objects.equals(((TypeElement) c).getSuperclass(), x.asType())).findAny()
+                                    .map(parent -> baseTypeVariableName.withBounds(TypeVariableName.get(parent.getSimpleName() + "T")))
+                                    .orElse(baseTypeVariableName);
 
-                    // build the bounded generics
-                    final TypeVariableName baseTypeVariableName = TypeVariableName.get(c.getSimpleName() + "T");
-                    return classes.stream().filter(x -> Objects.equals(((TypeElement) c).getSuperclass(), x.asType())).findAny()
-                            .map(parent -> baseTypeVariableName.withBounds(TypeVariableName.get(parent.getSimpleName() + "T")))
-                            .orElse(baseTypeVariableName);
-
-                }
-        ).collect(Collectors.toList()));
-
-
-        final MutableGraph<Element> g = GraphBuilder.directed().build();
-        for (Element e0 : classes) {
-            final TypeElement e = ((TypeElement) e0);
-            classes.stream().filter(x -> e.getSuperclass().equals(x.asType())).forEach(x -> {
-                g.putEdge(e0, x);
-            });
-        }
+                        }
+                ).collect(Collectors.toList()));
 
 
-        final Map<Element, Set<Element>> mapping = new HashMap<>();
-        for (Element e0 : classes) {
-            List<Element> m = new ArrayList<>();
-            m.add(e0);
-            m.addAll(g.predecessors(e0));
-            mapping.put(e0, new HashSet<>(m));
-        }
+        final Map<Element, Set<Element>> mapping = prepareMapping(classes);
 
 
         // complete the revisitor with the factory methods
-        final TypeSpec res = builder.addMethods(classes.stream().map(c ->
-                MethodSpec.methodBuilder(StringUtils.uncapitalize(String.valueOf(c.getSimpleName())))
+        final TypeSpec res = builder.addMethods(classes.stream()
+                .filter(it -> !it.getModifiers().contains(Modifier.ABSTRACT))
+                .map(c -> methodBuilder(StringUtils.uncapitalize('_' + StringUtils.uncapitalize(String.valueOf(c.getSimpleName()))))
                         .addModifiers(ABSTRACT)
                         .addModifiers(PUBLIC)
                         .addParameter(ParameterSpec.builder(TypeName.get(c.asType()), "it").build())
                         .returns(TypeVariableName.get(c.getSimpleName() + "T"))
-                        .build()
-        ).collect(Collectors.toList()))
+                        .build())
+                .collect(Collectors.toList()))
                 .addMethods(mapping.entrySet().stream().map(c -> {
-                            MethodSpec.Builder builder1 = MethodSpec.methodBuilder("$")
+                            MethodSpec.Builder builder1 = methodBuilder("$")
                                     .returns(TypeVariableName.get(c.getKey().getSimpleName() + "T"))
                                     .addModifiers(DEFAULT)
                                     .addModifiers(PUBLIC)
                                     .addParameter(ParameterSpec.builder(TypeName.get(c.getKey().asType()), "it").build());
-                            return builder1.addStatement(c.getValue().stream().map(x -> "if(java.util.Objects.equals(" + x.getSimpleName() + ".class, it.getClass())) return " + StringUtils.uncapitalize(x.getSimpleName().toString()) + "((" + x.getSimpleName() + ") it);")
-                                    .collect(Collectors.joining(System.lineSeparator())) + "return null").build();
+                            return builder1.addStatement(c.getValue()
+                                    .stream()
+                                    .filter(it -> !it.getModifiers().contains(Modifier.ABSTRACT))
+                                    .map(x -> "if(java.util.Objects.equals(" + x.getSimpleName() + ".class, it.getClass())) return _" + StringUtils.uncapitalize(x.getSimpleName().toString()) + "((" + x.getSimpleName() + ") it);")
+                                    .collect(Collectors.joining(lineSeparator(), "", lineSeparator())) + "return null").build();
                         }
                 ).collect(Collectors.toList()))
-
                 .build();
         return JavaFile.builder(revPackages, res).build();
+    }
+
+    private Map<Element, Set<Element>> prepareMapping(Set<? extends Element> classes) {
+
+        final Map<Element, Set<Element>> mapping = new HashMap<>();
+
+        if (classes.size() > 1) {
+
+            /*
+             * A grap dependency analysis is only needed if we have many element in the revisitor
+             */
+
+            final MutableGraph<Element> g = GraphBuilder.directed().build();
+            classes.forEach(e0 -> classes.stream()
+                    .filter(x -> {
+                        TypeMirror superclass = ((TypeElement) e0).getSuperclass();
+                        TypeMirror b = x.asType();
+                        return Objects.equals(superclass, b);
+                    })
+                    .forEach(x -> g.putEdge(e0, x)));
+
+            for (Element e0 : classes) {
+                final List<Element> m = new ArrayList<>();
+                m.add(e0);
+                if (g.nodes().contains(e0))
+                    m.addAll(g.predecessors(e0));
+                mapping.put(e0, new HashSet<>(m));
+            }
+        } else if (!classes.isEmpty()) {
+            mapping.put(classes.iterator().next(), new HashSet<>());
+        }
+        return mapping;
     }
 
     private void writeToDisk(final JavaFile javaFile) {
@@ -142,11 +160,11 @@ public class RevisitorProcessor extends AbstractProcessor {
     }
 
     private String initBasePackageName(String[] path) {
-        return Arrays.asList(path).subList(0, path.length - 1).stream().collect(Collectors.joining("."));
+        return asList(path).subList(0, path.length - 1).stream().collect(Collectors.joining("."));
     }
 
     private String initRevisitorClassName(String[] s1) {
-        return initBaseClassName(s1) + "Revisitor";
+        return initBaseClassName(s1);
     }
 
     private String initBaseClassName(String[] s) {
