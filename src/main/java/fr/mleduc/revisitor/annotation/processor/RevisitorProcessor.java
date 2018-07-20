@@ -2,6 +2,7 @@ package fr.mleduc.revisitor.annotation.processor;
 
 import com.google.auto.service.AutoService;
 import com.google.common.graph.GraphBuilder;
+import com.google.common.graph.Graphs;
 import com.google.common.graph.MutableGraph;
 import com.squareup.javapoet.*;
 import org.apache.commons.lang.StringUtils;
@@ -128,13 +129,14 @@ public class RevisitorProcessor extends AbstractProcessor {
                         TypeMirror b = x.asType();
                         return Objects.equals(superclass, b);
                     })
-                    .forEach(x -> g.putEdge(e0, x)));
+                    .forEach(x -> g.putEdge(x, e0)));
 
+            System.out.println(g);
             for (Element e0 : classes) {
                 final List<Element> m = new ArrayList<>();
                 m.add(e0);
                 if (g.nodes().contains(e0))
-                    m.addAll(g.predecessors(e0));
+                    m.addAll(Graphs.reachableNodes(g, e0));
                 mapping.put(e0, new HashSet<>(m));
             }
         } else if (!classes.isEmpty()) {
